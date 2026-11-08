@@ -1,135 +1,127 @@
-name: Android Build & Release
+name: Build Android APK and Release
 
 on:
   push:
     branches: [ main, master ]
-    tags: [ 'v*' ]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  GODOT_VERSION: "4.3"
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    env:
-      APP_VERSION_CODE: ${{ github.run_number }}
-      APP_VERSION_NAME: 1.0.${{ github.run_number }}
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Unzip uploaded zip files and find the Gradle project
+      # Works whether you uploaded the extracted project OR the raw .zip file.
+      - name: Find or extract Godot project
+        id: proj
+        shell: bash
         run: |
-          UNZ="$RUNNER_TEMP/unzipped"
-          mkdir -p "$UNZ"
-          # unzip every .zip found in the repo (and zips inside those zips)
-          for round in 1 2; do
-            find . "$UNZ" -iname '*.zip' -not -path './.git/*' -print0 | while IFS= read -r -d '' Z; do
-              [ -f "$Z.done" ] && continue
-              echo "Unzipping $Z"
-              unzip -q -o "$Z" -d "$UNZ/$(basename "$Z" .zip)_$round" || true
-              touch "$Z.done" 2>/dev/null || true
-            done
-          done
-          F=$(find . "$UNZ" -name settings.gradle.kts -not -path './.git/*' -not -path '*/__MACOSX/*' | head -n 1)
-          if [ -z "$F" ]; then
-            echo "ERROR: settings.gradle.kts not found (neither in the repo nor inside any zip). Files:"
-            find . "$UNZ" -maxdepth 4 -not -path './.git/*' | head -n 100
+          find_proj() { find . -name project.godot -not -path "./.git/*" -not -path "*/.godot/*" | head -n 1; }
+          P="$(find_proj)"
+          if [ -z "$P" ]; then
+            echo "project.godot not found - looking for zip files..."
+            mkdir -p _extracted
+            find . -iname "*.zip" -not -path "./.git/*" -not -path "./_extracted/*" > zips.txt
+            cat zips.txt
+            while read -r z; do
+              echo "Extracting $z"
+              unzip -o -q "$z" -d _extracted || true
+            done < zips.txt
+            P="$(find_proj)"
+          fi
+          if [ -z "$P" ]; then
+            echo "ERROR: project.godot not found in repo or in any zip"
             exit 1
           fi
-          DIR=$(cd "$(dirname "$F")" && pwd)
-          echo "Project folder: $DIR"
-          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          DIR="$(dirname "$P")"
+          echo "Godot project directory: $DIR"
+          ls -la "$DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Set up JDK 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Set up Gradle 8.9 (installs dependencies, caches them)
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      # If you add the 4 secrets below (see README) the release APK is signed with YOUR key.
-      # Without them a throw-away key is generated so the APK still installs.
-      - name: Prepare signing key
-        env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          SECRET_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          SECRET_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          SECRET_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Install Godot and export templates
+        shell: bash
         run: |
-          KS="$RUNNER_TEMP/release.jks"
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
-            echo "KEYSTORE_PASSWORD=$SECRET_STORE_PASSWORD" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=$SECRET_KEY_ALIAS" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD" >> "$GITHUB_ENV"
-            echo "Using signing key from repository secrets"
-          else
-            PASS="$(openssl rand -hex 12)"
-            keytool -genkeypair -alias moneycoming -keyalg RSA -keysize 2048 -validity 10000 \
-              -keystore "$KS" -storepass "$PASS" -keypass "$PASS" \
-              -dname "CN=Money Coming, OU=Game, O=MoneyComing, C=IN"
-            echo "KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS=moneycoming" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
-            echo "No secrets configured: generated a temporary signing key"
-          fi
-          echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
+          set -e
+          wget -q "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q "Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          sudo mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          wget -q "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          unzip -q "Godot_v${GODOT_VERSION}-stable_export_templates.tpz" -d tpl
+          mv tpl/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+          godot --version
 
-      - name: Build debug and release APKs
+      - name: Setup Android SDK
+        shell: bash
         run: |
-          set -o pipefail
-          gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --console=plain 2>&1 | tee build.log
+          export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM="$(find "$ANDROID_SDK_ROOT" -name sdkmanager -type f | head -n 1)"; fi
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platform-tools" "build-tools;34.0.0" "platforms;android-34"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
-      - name: Show build errors (short)
-        if: failure()
+      - name: Configure Godot for Android (debug keystore)
+        shell: bash
         run: |
-          {
-            echo "## Build errors (screenshot this)"
-            echo '```'
-            grep -E "^e: " build.log | sed 's#file://##' | head -40 || true
-            grep -A8 "What went wrong" build.log | head -30 || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          grep -E "^e: " build.log | head -40 || true
+          keytool -genkeypair -v -keystore "$HOME/debug.keystore" -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.config/godot"
+          for f in editor_settings-4.3.tres editor_settings-4.tres; do
+          cat > "$HOME/.config/godot/$f" << SETTINGS
+          [gd_resource type="EditorSettings" format=3]
 
-      - name: Collect APKs
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_SDK_ROOT"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/debug_keystore = "$HOME/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_pass = "android"
+          SETTINGS
+          done
+          sed -i 's/^          //' "$HOME/.config/godot/editor_settings-4.3.tres" "$HOME/.config/godot/editor_settings-4.tres"
+          cat "$HOME/.config/godot/editor_settings-4.3.tres"
+
+      - name: Import project
+        shell: bash
         run: |
-          mkdir -p out
-          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" "out/MoneyComing-v${APP_VERSION_NAME}-debug.apk"
-          cp "$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk" "out/MoneyComing-v${APP_VERSION_NAME}-release.apk"
-          ls -lh out
+          godot --headless --path "${{ steps.proj.outputs.dir }}" --import || true
+          godot --headless --path "${{ steps.proj.outputs.dir }}" --import || true
 
-      - name: Upload APK artifacts
+      - name: Export debug APK
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          godot --headless --verbose --path "${{ steps.proj.outputs.dir }}" --export-debug "Android" "$GITHUB_WORKSPACE/build/MoneyComing.apk"
+          ls -la "$GITHUB_WORKSPACE/build"
+          test -s "$GITHUB_WORKSPACE/build/MoneyComing.apk"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MoneyComing-APKs
-          path: out/*.apk
+          name: MoneyComing-APK
+          path: build/MoneyComing.apk
 
-      - name: Upload build reports on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-reports
-          path: |
-            **/build/reports
-
-      - name: Publish GitHub Release with APK
-        if: github.event_name != 'pull_request'
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v1.0.{0}', github.run_number) }}
-          name: Money Coming v${{ env.APP_VERSION_NAME }}
-          body: |
-            Money Coming - virtual-coin slot game (no real money).
-            Download **MoneyComing-v${{ env.APP_VERSION_NAME }}-release.apk**, open it on your Android phone and install
-            (allow "Install unknown apps" for your browser/file manager if asked).
-          files: out/*.apk
-          fail_on_unmatched_files: true
+          tag_name: v${{ github.run_number }}
+          name: Money Coming v${{ github.run_number }}
+          body: "Money Coming - debug APK (install on Android 10+)."
+          files: build/MoneyComing.apk
+          make_latest: true
