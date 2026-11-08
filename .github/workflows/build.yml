@@ -21,6 +21,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Unzip uploaded zip files and find the Gradle project
+        run: |
+          UNZ="$RUNNER_TEMP/unzipped"
+          mkdir -p "$UNZ"
+          # unzip every .zip found in the repo (and zips inside those zips)
+          for round in 1 2; do
+            find . "$UNZ" -iname '*.zip' -not -path './.git/*' -print0 | while IFS= read -r -d '' Z; do
+              [ -f "$Z.done" ] && continue
+              echo "Unzipping $Z"
+              unzip -q -o "$Z" -d "$UNZ/$(basename "$Z" .zip)_$round" || true
+              touch "$Z.done" 2>/dev/null || true
+            done
+          done
+          F=$(find . "$UNZ" -name settings.gradle.kts -not -path './.git/*' -not -path '*/__MACOSX/*' | head -n 1)
+          if [ -z "$F" ]; then
+            echo "ERROR: settings.gradle.kts not found (neither in the repo nor inside any zip). Files:"
+            find . "$UNZ" -maxdepth 4 -not -path './.git/*' | head -n 100
+            exit 1
+          fi
+          DIR=$(cd "$(dirname "$F")" && pwd)
+          echo "Project folder: $DIR"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -32,7 +55,8 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      # Secrets na ho to temporary key ban jati hai, APK phir bhi install hoti hai.
+      # If you add the 4 secrets below (see README) the release APK is signed with YOUR key.
+      # Without them a throw-away key is generated so the APK still installs.
       - name: Prepare signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -46,6 +70,7 @@ jobs:
             echo "KEYSTORE_PASSWORD=$SECRET_STORE_PASSWORD" >> "$GITHUB_ENV"
             echo "KEY_ALIAS=$SECRET_KEY_ALIAS" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "Using signing key from repository secrets"
           else
             PASS="$(openssl rand -hex 12)"
             keytool -genkeypair -alias moneycoming -keyalg RSA -keysize 2048 -validity 10000 \
@@ -54,17 +79,18 @@ jobs:
             echo "KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
             echo "KEY_ALIAS=moneycoming" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
+            echo "No secrets configured: generated a temporary signing key"
           fi
           echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
 
       - name: Build debug and release APKs
-        run: gradle assembleDebug assembleRelease --stacktrace
+        run: gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --stacktrace
 
       - name: Collect APKs
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/debug/app-debug.apk "out/MoneyComing-v${APP_VERSION_NAME}-debug.apk"
-          cp app/build/outputs/apk/release/app-release.apk "out/MoneyComing-v${APP_VERSION_NAME}-release.apk"
+          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" "out/MoneyComing-v${APP_VERSION_NAME}-debug.apk"
+          cp "$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk" "out/MoneyComing-v${APP_VERSION_NAME}-release.apk"
           ls -lh out
 
       - name: Upload APK artifacts
@@ -79,7 +105,6 @@ jobs:
         with:
           name: build-reports
           path: |
-            app/build/reports
             **/build/reports
 
       - name: Publish GitHub Release with APK
@@ -90,6 +115,7 @@ jobs:
           name: Money Coming v${{ env.APP_VERSION_NAME }}
           body: |
             Money Coming - virtual-coin slot game (no real money).
-            Download **MoneyComing-v${{ env.APP_VERSION_NAME }}-release.apk** and install it on your Android phone.
+            Download **MoneyComing-v${{ env.APP_VERSION_NAME }}-release.apk**, open it on your Android phone and install
+            (allow "Install unknown apps" for your browser/file manager if asked).
           files: out/*.apk
           fail_on_unmatched_files: true
