@@ -84,7 +84,21 @@ jobs:
           echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
 
       - name: Build debug and release APKs
-        run: gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --stacktrace
+        run: |
+          set -o pipefail
+          gradle -p "$PROJECT_DIR" assembleDebug assembleRelease --console=plain 2>&1 | tee build.log
+
+      - name: Show build errors (short)
+        if: failure()
+        run: |
+          {
+            echo "## Build errors (screenshot this)"
+            echo '```'
+            grep -E "^e: " build.log | sed 's#file://##' | head -40 || true
+            grep -A8 "What went wrong" build.log | head -30 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: " build.log | head -40 || true
 
       - name: Collect APKs
         run: |
